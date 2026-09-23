@@ -147,8 +147,15 @@ class StatusBot(discord.Client):
     def _new_provider_session(self) -> aiohttp.ClientSession:
         return aiohttp.ClientSession(
             headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "cross-site",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
                 "x-my-mc-auth": MY_MC_API_KEY,
             },
             timeout=aiohttp.ClientTimeout(total=20),
@@ -349,7 +356,7 @@ class StatusBot(discord.Client):
         if self.api_session is None or self.api_session.closed:
             self.api_session = self._new_provider_session()
 
-        retryable_statuses = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+        retryable_statuses = {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
         last_error = "provider request failed"
         for attempt in range(1, max(1, attempts) + 1):
             if self.provider_retry_until > time.monotonic():
@@ -370,6 +377,8 @@ class StatusBot(discord.Client):
 
                     if isinstance(data, dict):
                         message = str(data.get("message", "API rejected the request"))
+                    elif "Just a moment" in raw or response.status == 403:
+                        message = "Cloudflare WAF/Bot Protection blocked the request"
                     else:
                         message = raw[:200] or "empty provider response"
                     last_error = f"HTTP {response.status}: {self._provider_error_text(message)}"
@@ -438,7 +447,7 @@ class StatusBot(discord.Client):
                     log.info("Daily online /my-link: success=%s message=%s", link_success, link_message)
                 elif status_ok and online is False:
                     self.set_server_state(ServerState.STARTING)
-                    success, _, message = await self.provider_request("POST", "/start")
+                    success, _, message = await self.provider_request("GET", "/start")
                     self.save_start_marker(date_key)
                     self.last_recovery_result = f"daily start: {message}"
                     log.info("Automatic daily start: success=%s message=%s", success, message)
@@ -552,9 +561,6 @@ class StatusBot(discord.Client):
             embed.add_field(name=name, value=value, inline=inline)
         embed.set_footer(text=f"Live telemetry; periodic refresh every {DISCORD_EDIT_INTERVAL_SECONDS}s")
 
-        # Do not treat the relative Last-update timestamp as a meaningful
-        # change. It changes on every packet, while the displayed metrics below
-        # are the values users actually need refreshed.
         render_signature = (
             is_online,
             state.value,
@@ -700,3 +706,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
