@@ -8,9 +8,9 @@ from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import aiohttp
 import discord
 from aiohttp import web
+from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,7 +44,6 @@ PROVIDER_RETRY_MAX_SECONDS = max(
     float(os.getenv("PROVIDER_RETRY_MAX_SECONDS", "30")),
 )
 
-# The bot checks telemetry every 15 seconds. A heartbeat older than this is offline.
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL_SECONDS", "15"))
 STALE_AFTER = int(os.getenv("STALE_AFTER_SECONDS", "45"))
 HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
@@ -101,7 +100,6 @@ class StatusBot(discord.Client):
         self.status_message: discord.Message | None = None
         self.status_message_id: int | None = STATUS_MESSAGE_ID
 
-        # Telemetry is the source of truth for the watchdog and state machine.
         self.telemetry: dict[str, Any] = {}
         self.last_seen_monotonic: float | None = None
         self.last_seen_at: datetime | None = None
@@ -109,9 +107,7 @@ class StatusBot(discord.Client):
         self.server_state = ServerState.OFFLINE
         self.last_player_count: int | None = None
 
-        # The HTTP server and provider client are independent from Discord edits.
         self.http_runner: web.AppRunner | None = None
-        self.api_session: aiohttp.ClientSession | None = None
         self.recovery_lock = asyncio.Lock()
         self.last_recovery_monotonic: float | None = None
         self.last_recovery_result: str = "not attempted"
@@ -121,7 +117,6 @@ class StatusBot(discord.Client):
         self.start_attempted_date: str | None = self.load_start_marker()
         self.daily_start_retry_until = 0.0
 
-        # One serialized, coalescing Discord display pipeline.
         self.status_wakeup = asyncio.Event()
         self.status_event_pending = True
         self.last_discord_edit_monotonic: float | None = None
@@ -136,29 +131,11 @@ class StatusBot(discord.Client):
         self.automatic_actions_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
-        self.api_session = self._new_provider_session()
         self.status_updater_task = asyncio.create_task(
             self.status_update_loop(), name="discord-status-updater"
         )
         self.automatic_actions_task = asyncio.create_task(
             self.automatic_actions_loop(), name="minecraft-watchdog"
-        )
-
-    def _new_provider_session(self) -> aiohttp.ClientSession:
-        return aiohttp.ClientSession(
-            headers={
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "cross-site",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                "x-my-mc-auth": MY_MC_API_KEY,
-            },
-            timeout=aiohttp.ClientTimeout(total=20),
         )
 
     async def on_ready(self) -> None:
@@ -230,7 +207,6 @@ class StatusBot(discord.Client):
             self.last_seen_at = datetime.now(timezone.utc)
             self.last_player_count = clean["players"]
 
-        # Telemetry drives state transitions; Discord only displays them.
         if self.server_state != ServerState.ONLINE:
             self.set_server_state(ServerState.ONLINE)
         if previous_players is not None and previous_players != clean["players"]:
@@ -248,7 +224,6 @@ class StatusBot(discord.Client):
         self.request_status_update()
 
     def request_status_update(self) -> None:
-        # Coalesce all state/player/periodic requests into one newest render.
         self.status_event_pending = True
         self.status_wakeup.set()
 
@@ -261,9 +236,9 @@ class StatusBot(discord.Client):
                 self.status_message = await self.channel.fetch_message(self.status_message_id)
                 return
             except discord.NotFound:
-                log.warning("Saved status message was not found; creating one replacement message")
+                log.warning("Saved status message was not found; creating replacement message")
             except discord.HTTPException as error:
-                log.warning("Could not fetch saved status message (HTTP %s); will retry later", error.status)
+                log.warning("Could not fetch saved status message (HTTP %s)", error.status)
                 return
 
         try:
@@ -273,10 +248,10 @@ class StatusBot(discord.Client):
                 with open(STATUS_MESSAGE_ID_FILE, "w", encoding="utf-8") as file:
                     file.write(str(self.status_message_id))
             except OSError:
-                log.warning("Could not persist status message ID; set STATUS_MESSAGE_ID manually")
+                log.warning("Could not persist status message ID")
             log.info("Created status message ID: %s", self.status_message.id)
         except discord.HTTPException as error:
-            log.warning("Could not create status message (HTTP %s); status display will retry", error.status)
+            log.warning("Could not create status message (HTTP %s)", error.status)
 
     async def status_update_loop(self) -> None:
         await self.wait_until_ready()
@@ -304,11 +279,10 @@ class StatusBot(discord.Client):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Discord status updater loop failed; watchdog remains independent")
+                log.exception("Discord status updater loop failed")
                 await asyncio.sleep(1)
 
     async def automatic_actions_loop(self) -> None:
-        """Watchdog/provider automation, completely independent of Discord edits."""
         await self.wait_until_ready()
         while not self.is_closed():
             try:
@@ -339,7 +313,6 @@ class StatusBot(discord.Client):
             log.warning("Could not save automatic start marker: %s", error)
 
     def _provider_error_text(self, text: str) -> str:
-        # Keep diagnostics useful without ever echoing configured secrets.
         safe = str(text).replace(MY_MC_API_KEY, "[redacted]")
         safe = safe.replace(TELEMETRY_SECRET, "[redacted]")
         return safe[:200]
@@ -353,39 +326,52 @@ class StatusBot(discord.Client):
     ) -> tuple[bool, dict[str, Any] | None, str]:
         if not MY_MC_API_KEY:
             return False, None, "MY_MC_API_KEY is not configured"
-        if self.api_session is None or self.api_session.closed:
-            self.api_session = self._new_provider_session()
+
+        url = f"{MY_MC_BASE_URL}/{endpoint.lstrip('/')}"
+        headers = {
+            "x-my-mc-auth": MY_MC_API_KEY,
+            "Accept": "application/json, text/plain, */*",
+        }
 
         retryable_statuses = {403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
         last_error = "provider request failed"
+
         for attempt in range(1, max(1, attempts) + 1):
             if self.provider_retry_until > time.monotonic():
                 await asyncio.sleep(self.provider_retry_until - time.monotonic())
             try:
-                async with self.api_session.request(
-                    method, f"{MY_MC_BASE_URL}/{endpoint.lstrip('/')}"
-                ) as response:
-                    raw = await response.text()
+                # Use curl_cffi with Chrome 120 TLS fingerprinting to bypass Cloudflare WAF
+                async with AsyncSession(impersonate="chrome120") as session:
+                    response = await session.request(
+                        method,
+                        url,
+                        headers=headers,
+                        timeout=20,
+                    )
+                    raw = response.text
                     try:
-                        data = await response.json(content_type=None)
+                        data = response.json()
                     except Exception:
                         data = None
 
-                    if 200 <= response.status < 300 and isinstance(data, dict) and data.get("success") is True:
+                    status_code = response.status_code
+
+                    if 200 <= status_code < 300 and isinstance(data, dict) and data.get("success") is True:
                         self.provider_retry_until = 0.0
                         return True, data, str(data.get("message", "OK"))[:200]
 
                     if isinstance(data, dict):
                         message = str(data.get("message", "API rejected the request"))
-                    elif "Just a moment" in raw or response.status == 403:
+                    elif "Just a moment" in raw or status_code == 403:
                         message = "Cloudflare WAF/Bot Protection blocked the request"
                     else:
                         message = raw[:200] or "empty provider response"
-                    last_error = f"HTTP {response.status}: {self._provider_error_text(message)}"
+                    last_error = f"HTTP {status_code}: {self._provider_error_text(message)}"
 
-                    if response.status not in retryable_statuses or attempt >= attempts:
+                    if status_code not in retryable_statuses or attempt >= attempts:
                         log.warning("My-MC.Link %s %s failed: %s", method, endpoint, last_error)
                         return False, data if isinstance(data, dict) else None, last_error
+
                     retry_after = response.headers.get("Retry-After")
                     try:
                         delay = float(retry_after) if retry_after else min(
@@ -397,8 +383,8 @@ class StatusBot(discord.Client):
                             PROVIDER_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
                             PROVIDER_RETRY_MAX_SECONDS,
                         )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                last_error = self._provider_error_text(error)
+            except Exception as error:
+                last_error = self._provider_error_text(str(error))
                 if attempt >= attempts:
                     log.warning("My-MC.Link %s %s failed after retries: %s", method, endpoint, last_error)
                     return False, None, last_error
@@ -423,14 +409,11 @@ class StatusBot(discord.Client):
         return False, None, last_error
 
     async def run_automatic_actions(self) -> None:
-        """Run guarded provider actions without repeated calls every 15 seconds."""
         now = datetime.now(PROVIDER_TIMEZONE)
         date_key = now.date().isoformat()
         start_time = clock_time(START_HOUR, START_MINUTE)
         current_time = now.timetz().replace(tzinfo=None)
 
-        # Asia/Dhaka 10:00 by default. Once the scheduled time has passed, a
-        # process that woke slightly late still performs one attempt that day.
         in_start_window = current_time >= start_time
         if in_start_window and self.start_attempted_date != date_key and time.monotonic() >= self.daily_start_retry_until:
             async with self.recovery_lock:
@@ -611,7 +594,7 @@ class StatusBot(discord.Client):
                     retry_after = max(1.0, min(retry_after, DISCORD_MAX_BACKOFF_SECONDS))
                     self.discord_rate_limited_until = time.monotonic() + retry_after
                     log.warning(
-                        "Discord rate limit (429); pausing edits for %.1fs and coalescing newest state",
+                        "Discord rate limit (429); pausing edits for %.1fs",
                         retry_after,
                     )
                 else:
@@ -625,7 +608,7 @@ class StatusBot(discord.Client):
                 self.discord_backoff_seconds = min(delay * 2.0, DISCORD_MAX_BACKOFF_SECONDS)
                 log.warning("Transient Discord error; edit backed off for %.1fs: %s", delay, error)
             except Exception:
-                log.exception("Unexpected status-message edit failure; watchdog continues")
+                log.exception("Unexpected status-message edit failure")
 
     async def close(self) -> None:
         if self.status_updater_task is not None:
@@ -634,25 +617,13 @@ class StatusBot(discord.Client):
             self.automatic_actions_task.cancel()
         if self.http_runner is not None:
             await self.http_runner.cleanup()
-        if self.api_session is not None and not self.api_session.closed:
-            await self.api_session.close()
         await super().close()
 
 
 async def main() -> None:
-    """
-    Start the Render HTTP server before Discord login.
-
-    This means /health and /telemetry remain available even when Discord
-    temporarily rejects the login with HTTP 429. The same client is reused
-    after the Retry-After delay, so the HTTP server is not torn down during
-    the Discord cooldown.
-    """
     bot = StatusBot()
 
     try:
-        # Start Render's web endpoint BEFORE Discord login.
-        bot.api_session = bot._new_provider_session()
         await bot.start_http_server()
 
         while True:
@@ -665,7 +636,6 @@ async def main() -> None:
                     raise
 
                 retry_after = getattr(error, "retry_after", None)
-
                 if retry_after is None:
                     response = getattr(error, "response", None)
                     headers = getattr(response, "headers", {}) if response else {}
@@ -684,13 +654,7 @@ async def main() -> None:
                     "Discord login rate-limited (429); waiting %.1fs before retrying",
                     retry_after,
                 )
-
-                # IMPORTANT: do not call bot.close() here. The overridden
-                # close() also shuts down the Render HTTP server, which would
-                # make cron-job.org /health time out during the cooldown.
                 await asyncio.sleep(retry_after)
-
-                # Retry Discord login while keeping /health alive.
 
             except asyncio.CancelledError:
                 raise
@@ -699,11 +663,8 @@ async def main() -> None:
         if not bot.is_closed():
             await bot.close()
         elif bot.http_runner is not None:
-            # The HTTP runner can still exist if Discord login failed before
-            # the Discord client reached its normal close path.
             await bot.http_runner.cleanup()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
